@@ -49,7 +49,14 @@
 #include <uapi/linux/android/binder.h>
 #include "binder_trace.h"
 
+static DEFINE_MUTEX(binder_main_lock);
+static DEFINE_MUTEX(binder_deferred_lock);
+static DEFINE_MUTEX(binder_mmap_lock);
+
 static HLIST_HEAD(binder_devices);
+static HLIST_HEAD(binder_procs);
+static HLIST_HEAD(binder_deferred_list);
+static HLIST_HEAD(binder_dead_nodes);
 
 static struct dentry *binder_debugfs_dir_entry_root;
 static struct dentry *binder_debugfs_dir_entry_proc;
@@ -223,9 +230,10 @@ struct binder_context {
 	const char *name;
 };
 
-static struct binder_context global_context = {
-	.binder_context_mgr_uid = INVALID_UID,
-	.name = "binder",
+struct binder_device {
+	struct hlist_node hlist;
+	struct miscdevice miscdev;
+	struct binder_context context;
 };
 
 struct binder_work {
@@ -3367,7 +3375,6 @@ static int binder_open(struct inode *nodp, struct file *filp)
 		return -ENOMEM;
 	get_task_struct(current);
 	proc->tsk = current;
-	proc->context = &global_context;
 	INIT_LIST_HEAD(&proc->todo);
 	init_waitqueue_head(&proc->wait);
 	proc->default_priority = task_nice(current);
@@ -4180,18 +4187,10 @@ BINDER_DEBUG_ENTRY(transactions);
 BINDER_DEBUG_ENTRY(transaction_log);
 BINDER_DEBUG_ENTRY(failed_transaction_log);
 
-static void __init free_binder_device(struct binder_device *device)
-{
-	if (device->context.binder_deferred_workqueue)
-		destroy_workqueue(device->context.binder_deferred_workqueue);
-	kfree(device);
-}
-
 static int __init init_binder_device(const char *name)
 {
 	int ret;
 	struct binder_device *binder_device;
-	struct binder_context *context;
 
 	binder_device = kzalloc(sizeof(*binder_device), GFP_KERNEL);
 	if (!binder_device)
@@ -4201,38 +4200,26 @@ static int __init init_binder_device(const char *name)
 	binder_device->miscdev.minor = MISC_DYNAMIC_MINOR;
 	binder_device->miscdev.name = name;
 
-	context = &binder_device->context;
-	context->binder_context_mgr_uid = INVALID_UID;
-	context->name = name;
-
-	mutex_init(&context->binder_main_lock);
-	mutex_init(&context->binder_deferred_lock);
-	mutex_init(&context->binder_mmap_lock);
-
-	context->binder_deferred_workqueue =
-		create_singlethread_workqueue(name);
-
-	if (!context->binder_deferred_workqueue) {
-		ret = -ENOMEM;
-		goto err_create_singlethread_workqueue_failed;
-	}
-
-	INIT_HLIST_HEAD(&context->binder_procs);
-	INIT_HLIST_HEAD(&context->binder_dead_nodes);
-	INIT_HLIST_HEAD(&context->binder_deferred_list);
-	INIT_WORK(&context->deferred_work, binder_deferred_func);
+	binder_device->context.binder_context_mgr_uid = INVALID_UID;
+	binder_device->context.name = name;
 
 	ret = misc_register(&binder_device->miscdev);
 	if (ret < 0) {
-		goto err_misc_register_failed;
+		kfree(binder_device);
+		return ret;
 	}
 
 	hlist_add_head(&binder_device->hlist, &binder_devices);
-	return ret;
 
-err_create_singlethread_workqueue_failed:
-err_misc_register_failed:
-	free_binder_device(binder_device);
+	return ret;
+}
+
+static int __init binder_init(void)
+{
+	int ret;
+	char *device_name, *device_names;
+	struct binder_device *device;
+	struct hlist_node *tmp;
 
 	return ret;
 }
@@ -4301,6 +4288,36 @@ err_init_binder_device_failed:
 		hlist_del(&device->hlist);
 		free_binder_device(device);
 	}
+
+	/*
+	 * Copy the module_parameter string, because we don't want to
+	 * tokenize it in-place.
+	 */
+	device_names = kzalloc(strlen(binder_devices_param) + 1, GFP_KERNEL);
+	if (!device_names) {
+		ret = -ENOMEM;
+		goto err_alloc_device_names_failed;
+	}
+	strcpy(device_names, binder_devices_param);
+
+	while ((device_name = strsep(&device_names, ","))) {
+		ret = init_binder_device(device_name);
+		if (ret)
+			goto err_init_binder_device_failed;
+	}
+
+	return ret;
+
+err_init_binder_device_failed:
+	hlist_for_each_entry_safe(device, tmp, &binder_devices, hlist) {
+		misc_deregister(&device->miscdev);
+		hlist_del(&device->hlist);
+		kfree(device);
+	}
+err_alloc_device_names_failed:
+	debugfs_remove_recursive(binder_debugfs_dir_entry_root);
+
+	destroy_workqueue(binder_deferred_workqueue);
 
 	return ret;
 }
