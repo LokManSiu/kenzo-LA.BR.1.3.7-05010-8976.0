@@ -21,11 +21,12 @@
 #include <linux/list.h>
 #include <linux/proc_fs.h>
 #include <linux/profile.h>
-#include <linux/rtmutex.h>
 #include <linux/sched.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
+#include <linux/rtmutex.h>
+#include <linux/cpufreq.h>
 
 #define UID_HASH_BITS	10
 DECLARE_HASHTABLE(hash_table, UID_HASH_BITS);
@@ -98,11 +99,9 @@ static int uid_cputime_show(struct seq_file *m, void *v)
 {
 	struct uid_entry *uid_entry;
 	struct task_struct *task, *temp;
-	struct user_namespace *user_ns = current_user_ns();
 	cputime_t utime;
 	cputime_t stime;
 	unsigned long bkt;
-	uid_t uid;
 
 	rt_mutex_lock(&uid_lock);
 
@@ -114,13 +113,14 @@ static int uid_cputime_show(struct seq_file *m, void *v)
 
 	read_lock(&tasklist_lock);
 	do_each_thread(temp, task) {
-		uid = from_kuid_munged(user_ns, task_uid(task));
-		uid_entry = find_or_register_uid(uid);
+		uid_entry = find_or_register_uid(from_kuid_munged(
+			current_user_ns(), task_uid(task)));
 		if (!uid_entry) {
 			read_unlock(&tasklist_lock);
 			rt_mutex_unlock(&uid_lock);
 			pr_err("%s: failed to find the uid_entry for uid %d\n",
-				__func__, uid);
+				__func__, from_kuid_munged(current_user_ns(),
+				task_uid(task)));
 			return -ENOMEM;
 		}
 		/* if this task is exiting, we have already accounted for the
@@ -178,7 +178,8 @@ static ssize_t uid_remove_write(struct file *file,
 	struct hlist_node *tmp;
 	char uids[128];
 	char *start_uid, *end_uid = NULL;
-	long int uid_start = 0, uid_end = 0;
+	long int start = 0, end = 0;
+	uid_t uid_start, uid_end;
 
 	if (count >= sizeof(uids))
 		count = sizeof(uids) - 1;
@@ -193,15 +194,32 @@ static ssize_t uid_remove_write(struct file *file,
 	if (!start_uid || !end_uid)
 		return -EINVAL;
 
-	if (kstrtol(start_uid, 10, &uid_start) != 0 ||
-		kstrtol(end_uid, 10, &uid_end) != 0) {
+	if (kstrtol(start_uid, 10, &start) != 0 ||
+		kstrtol(end_uid, 10, &end) != 0) {
 		return -EINVAL;
 	}
+
+#define UID_T_MAX (((uid_t)~0U)-1)
+	if ((start < 0) || (end < 0) ||
+		(start > UID_T_MAX) || (end > UID_T_MAX)) {
+		return -EINVAL;
+	}
+
+	uid_start = start;
+	uid_end = end;
+
+	/* TODO need to unify uid_sys_stats interface with uid_time_in_state.
+	 * Here we are reusing remove_uid_range to reduce the number of
+	 * sys calls made by userspace clients, remove_uid_range removes uids
+	 * from both here as well as from cpufreq uid_time_in_state
+	 */
+	cpufreq_task_stats_remove_uids(uid_start, uid_end);
+
 	rt_mutex_lock(&uid_lock);
 
 	for (; uid_start <= uid_end; uid_start++) {
 		hash_for_each_possible_safe(hash_table, uid_entry, tmp,
-							hash, (uid_t)uid_start) {
+							hash, uid_start) {
 			if (uid_start == uid_entry->uid) {
 				hash_del(&uid_entry->hash);
 				kfree(uid_entry);
@@ -210,6 +228,7 @@ static ssize_t uid_remove_write(struct file *file,
 	}
 
 	rt_mutex_unlock(&uid_lock);
+
 	return count;
 }
 
@@ -473,7 +492,7 @@ static int __init proc_uid_sys_stats_init(void)
 		&uid_io_fops, NULL);
 
 	proc_parent = proc_mkdir("uid_procstat", NULL);
-	if (!proc_parent) {
+	if (!io_parent) {
 		pr_err("%s: failed to create uid_procstat proc entry\n",
 			__func__);
 		goto err;
